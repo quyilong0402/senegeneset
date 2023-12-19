@@ -1,2 +1,1 @@
-# senegeneset
-A tissue-ubiquitous gene set for cellular senescence
+# A tissue-ubiquitous gene set for cellular senescence
