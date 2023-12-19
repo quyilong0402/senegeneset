@@ -1,0 +1,131 @@
+---
+title: "GTEx aging gene"
+output: html_document
+date: "2023-07-18"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(limma)
+library(BiocParallel)
+library(reshape2)
+library(grid)
+library(edgeR)
+rm(list = ls())
+setwd("/path/to/GTEx/data/folder/") 
+# path to folder containing:
+# "bulk-gex_v8_rna-seq_GTEx_Analysis_2017-06-05_v8_RSEMv1.3.0_transcript_tpm.gct.gz"
+# "GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_reads.gct.gz"
+# "annotations_v8_GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
+# "annotations_v8_GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt"
+```
+
+# read expression matrix and metadata
+read files
+```{r}
+tpm = read.delim(file="./bulk-gex_v8_rna-seq_GTEx_Analysis_2017-06-05_v8_RSEMv1.3.0_transcript_tpm.gct.gz", skip=2)
+bulk = read.delim(file="./GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_reads.gct.gz", skip=2)
+
+# meta1 contains tissue info, meta2 has age and sex
+meta1 = read.delim("./annotations_v8_GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt")
+meta2 = read.delim("./annotations_v8_GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt")
+```
+
+# clean metadata annotations
+```{r}
+meta = meta1[,c("SAMPID", "SMTS", "SMTSD")]
+meta$sample <- sapply(meta$SAMPID, function(x) {
+  parts <- strsplit(x, split = "-")[[1]]
+  return(paste(parts[1:2], collapse = "-"))
+})
+meta$age = plyr::mapvalues(meta$sample, meta2$SUBJID, meta2$AGE)
+meta$sex = plyr::mapvalues(meta$sample, meta2$SUBJID, meta2$SEX)
+meta$sex = ifelse(meta$sex == "2", "female", "male")
+rownames(meta) = meta$SAMPID
+colnames(meta) = c("ID", "tissue0", "tissue", "sample", "age", "sex")
+
+rownames(meta) = meta$ID
+meta$tissue0 = gsub(" ", "_", meta$tissue0)
+colnames(bulk) = gsub("\\.", "-", colnames(bulk))
+s = intersect(meta$ID, colnames(bulk))
+meta = meta[s,]
+bulk = bulk[, s]
+bulk = bulk[unique(rownames(bulk)),]
+tpm = tpm[rownames(bulk),]
+tpm = log(tpm + 1)
+
+ages = NULL
+for (a in meta$age) {
+  a0 = as.numeric(unlist(strsplit(a, "-"))[1])
+  a1 = as.numeric(unlist(strsplit(a, "-"))[2])
+  age = (a0 + a1)/2
+  ages = c(ages, age)
+}
+meta$age_num = ages
+```
+
+# filter by tpm
+```{r}
+tissues = unique(meta$tissue0)
+filter_genes = function(t, meta, tpm) {
+  print(t)
+  ids = which(meta$tissue0 == t)
+  this.tissue = tpm[, ids]
+  fun = function(x) {sum(x>1) > 0.05*ncol(this.tissue)}
+  this.tissue.result = apply(this.tissue, MARGIN = 1, fun)
+  return(this.tissue.result)
+}
+genes.results = lapply(
+  as.list(tissues),
+  filter_genes,
+  meta, tpm
+)
+genes.results = do.call("cbind", genes.results)
+rownames(genes.results) = rownames(bulk)
+colnames(genes.results) = tissues
+saveRDS(genes.results, "./filtered_genes_bulk.rds")
+f = readRDS("./filtered_genes_bulk.rds")
+```
+
+# Differential expression with limma
+```{r}
+get_ct = function(i, meta, bulk, f) {
+  ct = unique(meta$tissue0)[i]
+  print(ct)
+  id = which(meta$tissue0 == ct)
+  meta.sub = meta[id, ]
+  f.sub = f[rownames(bulk),ct]
+  bulk.sub = bulk[names(f.sub)[f.sub],id]
+  
+  if (length(unique(meta.sub$sex)) == 1) {
+    print("only 1 sex present, design without sex")
+    design <- cbind(1, meta.sub$age_num)
+    colnames(design) = c("intercept", "age")
+  } else {
+    design <- cbind(1, meta.sub$age_num, as.factor(meta.sub$sex))
+    colnames(design) = c("intercept", "age", "sex")
+  }
+  
+  dge = DGEList(bulk.sub)
+  dge = calcNormFactors(dge)
+  dge = voom(dge, design)
+  fit = lmFit(dge, design)
+  fit <- eBayes(fit, trend=TRUE)
+  tab <- topTable(fit, coef="age", number = Inf)
+  tab.all = tab[rownames(bulk),]; rownames(tab.all) = rownames(bulk)
+  return(tab.all)
+}
+
+f = readRDS("./filtered_genes_bulk.rds")
+out = bplapply(
+  as.list(1:length(unique(meta$tissue0))),
+  get_ct,
+  meta, bulk, f,
+  BPPARAM = MulticoreParam(workers = 3, progressbar = T)
+)
+names(out) = unique(meta$tissue0)
+saveRDS(out, "./bulk_dge.rds")
+```

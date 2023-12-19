@@ -1,0 +1,419 @@
+---
+title: "Mouse_bulk_model"
+output: html_document
+date: "2023-09-01"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(tidyverse)
+library(BiocParallel)
+library(reshape2)
+library(pheatmap)
+library(grid)
+library(ggsignif)
+library(CellChat)
+rm(list = ls())
+setwd("/path/to/single/cell/data/")
+```
+
+
+2. use human gs convert
+```{r}
+mouse_human_genes = read.csv("http://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt",sep="\t")
+results = readRDS("~/Research/Aging/data/GTEx/union_sen_quest.rds")
+
+h = mouse_human_genes[mouse_human_genes$Common.Organism.Name == "human", ]
+m = mouse_human_genes[mouse_human_genes$Common.Organism.Name == "mouse, laboratory", ]
+genes = rownames(results)[rownames(results) %in% h$Symbol] # sen genes in df
+
+map_human = NULL
+map_mouse = NULL
+for (g in genes) {
+  id = h$DB.Class.Key[h$Symbol == g]
+  if (length(id) == 1) {
+    mouse.g = m$Symbol[m$DB.Class.Key == id]
+
+    map_human = c(map_human, g)
+    map_mouse = c(map_mouse, mouse.g)
+  } 
+}
+
+results.m = results[map_human[map_human!="CCL3L1"],]
+rownames(results.m) = plyr::mapvalues(rownames(results.m), map_human,map_mouse)
+```
+
+
+#Fig2e mouse
+```{r}
+p1 = 47110/25064;p2 = 14161/5578;p3 = 4526/1537; p4 = 1384/419; p5 = 509/139; p6 = 132/37; p7 = 18/4; p8=5
+df4 = data.frame(n_gs = paste0(">=",1:8), ps = c(p1, p2, p3,p4,p5,p6,p7,p8))
+f2m4 = ggplot(df4, aes(x=n_gs, y=ps, fill=n_gs)) +
+  geom_bar(stat = "identity", alpha=0.6, color="black") +
+  scale_fill_brewer(palette = "YlOrRd") +
+  theme_bw() +
+  labs(x = NULL, y = "n_edge/n_expected", fill="n genesets") +
+  ggtitle("PPI enrichment (mouse)")
+f2m4
+ggsave("~/Research/Aging/manuscript_1/Figure2/f2m4.png", f2m4, dpi = 300, width = 5, height = 4)
+```
+
+
+#single cell TM
+```{r}
+mouse_human_genes = read.csv("http://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt",sep="\t")
+tm = readRDS("~/Research/Aging/data/Tabula_Muris/TM.rds")
+convert = readxl::read_xlsx("~/Research/Aging/manuscript_1/supplementary/sup_table/S6_celltype_conversion.xlsx", sheet = 2)
+tm$celltype = plyr::mapvalues(tm$cell_ontology_class, convert$ct_tm, convert$cleaned)
+
+tm$tissue[tm$tissue=="BAT"] = "Brown Adipose"
+tm$tissue[tm$tissue=="GAT"] = "Gonadal Adipose"
+tm$tissue[tm$tissue=="MAT"] = "Marrow Adipose"
+tm$tissue[tm$tissue=="SCAT"] = "Subcutaneous Adipose"
+tm$tissue[grepl( "Muscle", tm$tissue)] = "Muscle"
+tm$tissue[tm$tissue == "Marrow"] = "Bone Marrow"
+tm$tissue = sub("_", " ", tm$tissue)
+
+hTom = function(genes) {
+  h = mouse_human_genes[mouse_human_genes$Common.Organism.Name == "human", ]
+  m = mouse_human_genes[mouse_human_genes$Common.Organism.Name == "mouse, laboratory", ]
+  genes = genes[genes %in% h$Symbol]
+  map_mouse = NULL
+  for (g in genes) {
+    id = h$DB.Class.Key[h$Symbol == g]
+    mouse.g = m$Symbol[m$DB.Class.Key == id]
+    map_mouse = c(map_mouse, mouse.g)
+  }
+  return(map_mouse)
+}
+m.s.genes <- hTom(cc.genes.updated.2019$s.genes)
+m.g2m.genes <- hTom(cc.genes.updated.2019$g2m.genes)
+
+up = GetAssayData(tm, "counts")[c("Cdkn1a", "Cdkn2b", "Il6", "Cdkn2a"),]
+sene = colMeans(up!=0) >= 3/4;
+tm$SENE = ifelse(sene, "SENE", "non_SENE")
+tm.norm = NormalizeData(tm)
+tm.norm <- CellCycleScoring(tm.norm, s.features = m.s.genes, g2m.features = m.g2m.genes, set.ident = F)
+```
+
+
+#. Fig2d mouse
+```{r}
+union.gs = results.m[rownames(results.m) %in% rownames(tm.norm),][,1:10]
+ctrl.genes = rownames(tm.norm)[!rownames(tm.norm) %in% rownames(results.m)]
+control = as.data.frame(matrix(F, nrow = length(ctrl.genes), ncol = 9))
+control = cbind(control, 0)
+rownames(control) = ctrl.genes
+colnames(control) = colnames(results.m)[1:10]
+union.gs = rbind(union.gs, control)
+
+mtx = GetAssayData(tm.norm, "data")[rownames(union.gs),]
+mtx.binary = mtx!=0
+mtx.binary = mtx.binary[!rowMeans(mtx.binary) %in% c(0, 1), ]
+phase = ifelse(tm.norm$Phase == "G1", "g1", "non-g1")
+or_table <- t(apply(mtx.binary, 1, function(row) {
+  table(row, phase)
+}))
+
+fun = function(x) {
+  out1 = (x[1]/x[3])/(x[2]/x[4])
+  out2 = (x[2]/x[4])/(x[1]/x[3])
+  return(max(log(out1), log(out2)))
+}
+ORs = apply(or_table, 1, fun)
+union.gs$ORs = NA
+union.gs[names(ORs), "ORs"] = ORs
+union.gs = union.gs[,c("n", "ORs")]
+union.gs <- union.gs[is.finite(union.gs$ORs),]
+
+union.gs = readRDS("./tm_g1.rds")
+mtx = GetAssayData(tm, "counts")
+genes = rownames(tm)[rowMeans(mtx!=0) < 0.05]
+union.gs$ORs[rownames(union.gs) %in% unique(c(genes, m.g2m.genes, m.s.genes))] = NA
+
+ors = NULL
+len = NULL
+for (n in 1:8) {
+  ors = c(ors, union.gs$ORs[union.gs$n >= n])
+  len = c(len, sum(union.gs$n >= n))
+}
+df = data.frame(
+  n = rep(paste0(">=", 1:8), len),
+  ors = ors
+)
+df = rbind(df, data.frame(
+  n = rep("0", sum(union.gs$n == 0)),
+  ors = union.gs$ORs[union.gs$n == 0]
+))
+df$n = factor(df$n, levels = c("0", paste0(">=", 1:8)))
+
+f2m5 = ggplot(df, aes(x = as.factor(n), y = ors, fill=as.factor(n))) +
+  geom_violin(alpha = 0.6, scale = "width") +
+  stat_summary(fun = median, geom = "point", size = 2, color = "black") +
+  stat_summary(fun=median, geom="line", aes(group=1), color="#3E3C3C")+
+  scale_fill_brewer(palette = "GnBu") +
+  labs(y = "G1 log odds ratio", x = NULL, fill= "n genesets") +
+  geom_signif(comparisons = list(c(">=8", "0"), c(">=7", "0"), c(">=6", "0")), map_signif_level=TRUE, test = "wilcox.test", y_position = c(3.9, 3.7, 3.4)) +
+  theme_bw() +
+  ggtitle("G1 log odds ratio (TM)")
+f2m5
+```
+
+
+# Fig2g Mouse
+```{r}
+t2 = tm@meta.data[,c("tissue", "cell_ontology_class", "SENE")]
+t2$celltype = plyr::mapvalues(t2$cell_ontology_class, convert$ct_tm, convert$cleaned)
+t2$tissue_ct = paste0(t2$tissue, "~", t2$celltype)
+t2 = as.data.frame(table(t2$tissue_ct, t2$SENE))
+t2 = t2 %>% group_by(Var1) %>% mutate(prop = Freq/sum(Freq))
+t2$celltype = sub(".*~", "", t2$Var1)
+t2$tissue = sub("~.*", "", t2$Var1)
+t2 = as.data.frame(t2[t2$Var2 == "SENE",])
+
+mat = matrix(NA, nrow = length(unique(t2$celltype)), ncol = length(unique(t2$tissue)), dimnames = list(unique(t2$celltype), unique(t2$tissue)))
+for (i in 1:nrow(t2)) {
+  mat[t2[i,"celltype"], t2[i, "tissue"]] = t2[i, "prop"]
+}
+mat = mat*100
+
+ctsum = as.data.frame(tm@meta.data %>% group_by(celltype) %>% summarize(pt=mean(SENE=="SENE")*100)) %>% arrange(-pt)
+ctsum = ctsum[1:10,]
+ctsum$Var2 = "Overall %"
+colnames(ctsum) = c("Var1", "value", "Var2")
+
+tsum = as.data.frame(tm@meta.data %>% group_by(tissue) %>% summarize(pt=mean(SENE=="SENE")*100)) %>% arrange(-pt)
+tsum$Var1 = "Overall %"
+colnames(tsum) = c("Var2", "value", "Var1")
+
+mat = mat[ctsum$Var1, tsum$Var2]
+
+df = melt(mat)
+df = rbind(df, rbind(tsum, ctsum))
+df$t_num = 25-as.numeric(df$Var2)
+df$t_num[df$Var2 == "Overall %"] = 25.3
+df$ct_num = as.numeric(df$Var1)
+df$ct_num[df$Var1 == "Overall %"] = df$ct_num[df$Var1 == "Overall %"] + 0.2
+
+
+f2ptm = ggplot(df, aes(x = ct_num, y=t_num, fill=value)) + 
+  scale_fill_gradientn(
+    colors = c("white","cyan","#44ABEE", "#5785FF", "#093ABD"),
+    values = c(0, 0.15, 0.3, 0.45, 1), na.value = "#DDDDDD"
+    ) +
+  geom_tile() + 
+  scale_y_continuous(breaks = unique(df$t_num), labels = unique(df$Var2), expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(breaks = unique(df$ct_num), labels = unique(df$Var1), expand = expansion(mult = c(0, 0.05))) +
+  annotate("rect", xmin = 10.5+0.2, xmax = 11.5+0.2,
+    ymin = 1.5, ymax = 24.5, alpha = 1, color="black", fill=NA) +
+  annotate("rect", xmin = 0.5, xmax = 10.5,
+    ymin = 24.5+0.3, ymax = 25.5+0.3, alpha = 1, color="black", fill=NA) +
+  theme_minimal() +
+  labs(x = NULL, y = NULL, fill= "SENE percent") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, face = c(rep("plain", 10), "bold")),
+        axis.text.y = element_text(face = c(rep("plain", 23), "bold")),
+        legend.position = "bottom",
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank())
+
+f2ptm
+```
+
+
+# Cell Chat
+```{r}
+get_cellchat = function(t, tm.norm) {
+  print(t)
+  this.t = tm.norm[,tm.norm$tissue == t]
+  meta = this.t@meta.data; meta$cluster_cc = meta$cell_ontology_class
+  meta$cluster_cc[meta$SENE == "SENE"] = "SENE"
+  cellchat = createCellChat(this.t, meta = meta, group.by = "cluster_cc")
+  cellchat <- setIdent(cellchat, ident.use = "cluster_cc")
+  CellChatDB <- CellChatDB.mouse
+  CellChatDB.use <- CellChatDB
+  cellchat@DB <- CellChatDB.use
+  cellchat <- subsetData(cellchat)
+  cellchat <- identifyOverExpressedGenes(cellchat)
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+  cellchat <- projectData(cellchat, PPI.mouse)
+  cellchat <- computeCommunProb(cellchat)
+  cellchat <- filterCommunication(cellchat, min.cells = 0)
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat <- aggregateNet(cellchat)
+  
+  saveRDS(cellchat, paste0("./cellchat/", t, ".rds"))
+}
+
+bplapply(
+  as.list(unique(tm.norm$tissue)),
+  get_cellchat,
+  tm.norm,
+  BPPARAM = MulticoreParam(workers = 5, progressbar = T)
+)
+```
+
+# network target/pathways heatmap
+```{r}
+# t1 is celltype interaction table
+t1 = matrix(NA, nrow = 23, ncol = length(unique(convert$cleaned)) + 1,
+dimnames = list(sub("\\..*", "", list.files("./cellchat/")), c("SENE", unique(convert$cleaned))))
+
+# t2 is pathway list
+t2 = list()
+t2.paths = NULL
+
+for (f in list.files("./cellchat/")) {
+  name = sub("\\..*", "", f)
+  print(name)
+  cc = readRDS(paste0("./cellchat/", f))
+  cts = levels(cc@idents)
+  group.celltype = plyr::mapvalues(cts, convert$ct_tm, convert$cleaned, warn_missing = F)
+  cc = mergeInteractions(cc, group.celltype)
+  
+  # ct interaction
+  i1 = cc@net$weight.merged["SENE",]
+  # i1 = i1/sum(i1)
+  t1[name, names(i1)] = i1
+  
+  # pathways
+  i2 = apply(cc@netP$prob["SENE",,], 2, mean)
+  # i2 = i2/sum(i2)
+  t2[[name]] = i2
+  t2.paths = unique(c(t2.paths, names(i2)))
+}
+
+#process t2 into table
+t = matrix(0, nrow = 23, ncol=length(t2.paths), dimnames = list(names(t2), t2.paths))
+for (i in 1:length(t2)) {
+  name = names(t2)[i]
+  ps = t2[[i]]
+  t[name, names(ps)] = ps
+}
+colnames(t1)[colnames(t1)=="SENE"] = "SnC"
+
+renameTissues = function(mtx) {
+  rownames(mtx) = sub("_", " ", rownames(mtx))
+  rownames(mtx)[rownames(mtx)=="BAT"] = "Brown Adipose"
+  rownames(mtx)[rownames(mtx)=="GAT"] = "Gonadal Adipose"
+  rownames(mtx)[rownames(mtx)=="MAT"] = "Marrow Adipose"
+  rownames(mtx)[rownames(mtx)=="SCAT"] = "Subcutaneous Adipose"
+  rownames(mtx)[grepl( "Muscle",rownames(mtx))] = "Muscle"
+  rownames(mtx)[rownames(mtx) == "Marrow"] = "Bone Marrow"
+  return(mtx)
+}
+t1 = renameTissues(t1); t = renameTissues(t)
+
+saveRDS(t1, "./cc_path1.rds")
+saveRDS(t, "./cc_path2.rds")
+```
+
+# Fig2 k mouse
+```{r}
+t1 = readRDS("./cc_path1.rds"); t = readRDS("./cc_path2.rds")
+mat1 = t1
+
+df1 = melt(mat1)
+
+add = df1 %>% group_by(Var2) %>% summarize(value = mean(value, na.rm=T)) %>% arrange(-value)
+add$Var1 = rep("Mean", ncol(mat1))
+df1 = rbind(add, df1)
+df1$Var1 = factor(df1$Var1, levels = c("Mean", levels(df$Var2)))
+df1$tnum = 21-as.numeric(df1$Var1)
+df1$tnum[df1$Var1 == "Mean"] = 20.3
+
+df1$Var2 = factor(df1$Var2, levels = add$Var2)
+# df1 = df1[df1$Var2 %in% add$Var2[1:10],]
+
+ccm1 = ggplot(df1, aes(x = Var2, y=tnum, fill=value)) + 
+  scale_fill_gradientn(
+    colors = c("white", "#7A00FF", "#5604AF"),
+    values = c(0, 0.7, 1), na.value = "#DDDDDD"
+    ) +
+  geom_tile() + 
+  scale_y_continuous(breaks = unique(df1$tnum), labels = unique(df1$Var1), expand = expansion(mult = c(0, 0.05))) +
+  annotate("rect", xmin = 0.5, xmax = 10.5,
+    ymin = 19.5+0.3, ymax = 20.5+0.3, alpha = 1, color="black", fill=NA) +
+  labs(x = NULL, y = NULL, fill= "Interaction score") +
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(face = c("bold", rep("plain", 23))),
+        legend.position = "bottom",
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank())
+ccm1
+# ggsave("~/Research/Aging/manuscript_1/Figure2/ccm1.png", ccm1, dpi = 300, width = 7, height = 5)
+```
+
+# Fig2m mouse
+```{r}
+mat2 = t
+df2 = melt(mat2)
+add = df2 %>% group_by(Var2) %>% summarize(value = mean(value, na.rm=T)) %>% arrange(-value)
+add$Var1 = rep("Mean", ncol(mat2))
+
+df2 = rbind(add, df2)
+df2$Var1 = factor(df2$Var1, levels = c("Mean", levels(df$Var2)))
+df2$tnum = 21-as.numeric(df2$Var1)
+df2$tnum[df2$Var1 == "Mean"] = 20.3
+
+df2$Var2 = factor(df2$Var2, levels = add$Var2)
+df2 = df2[df2$Var2 %in% add$Var2[1:10],]
+
+
+ccm2 = ggplot(df2, aes(x = Var2, y=tnum, fill=value)) + 
+  scale_fill_gradientn(
+    colors = c("white", "#FE6E4A", "#E53C12"),
+    values = c(0, 0.7, 1), na.value = "#DDDDDD"
+    ) +
+  geom_tile() + 
+  scale_y_continuous(breaks = unique(df2$tnum), labels = unique(df2$Var1), expand = expansion(mult = c(0, 0.05))) +
+  annotate("rect", xmin = 0.5, xmax = 10.5,
+    ymin = 19.5+0.3, ymax = 20.5+0.3, alpha = 1, color="black", fill=NA) +
+  labs(x = NULL, y = NULL, fill= "Interaction score") +
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(face = c("bold", rep("plain", 23))),
+        legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank())
+ccm2
+
+```
+
+# Supplementary mouse
+```{r}
+library(CellChat)
+for (f in list.files("~/Research/Aging/data/Tabula_Muris/cellchat/")) {
+  name = sub("\\..*", "", f)
+  print(name)
+  if (name %in% c("Diaphragm", "Skin", "Spleen", "Thymus")) {next}
+  cc = readRDS(paste0("~/Research/Aging/data/Tabula_Muris/cellchat/", f))
+  cts = levels(cc@idents)
+  group.celltype = plyr::mapvalues(cts, convert$ct_tm, convert$cleaned, warn_missing = F)
+  cc = mergeInteractions(cc, group.celltype)
+  
+  png(file=paste0("~/Research/Aging/manuscript_1/cc_figures/sup_mouse/cc_", name, "1.png"), res = 300, width=1440, height=1440*1.16)
+  netVisual_circle(
+    cc@net$weight.merged, weight.scale = T, 
+    sources.use = "SENE",
+    edge.width.max = 20,
+  )
+  dev.off()
+  
+  png(file=paste0("~/Research/Aging/manuscript_1/cc_figures/sup_mouse/cc_", name, "2.png"), res = 300, width=1500, height=1500)
+  netVisual_chord_gene(
+    cc,
+    sources.use = "SENE",
+    slot.name = "netP", 
+    signaling = names(sort(apply(cc@netP$prob["SENE",,], 2, mean), decreasing = T))[1:10],
+    show.legend = F
+  )
+  dev.off()
+}
+```
